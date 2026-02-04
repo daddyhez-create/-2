@@ -209,9 +209,180 @@ def plot_final_result(df_rank):
 
     plt.tight_layout()
     plt.show()
+import scipy.optimize as sco
 
 # ==========================================
-# 主程序
+# 6. Black-Litterman 核心引擎 (新增模块)
+# ==========================================
+class BlackLittermanStrategy:
+    def __init__(self, price_data, sector_ranks, risk_aversion=2.5, tau=0.05):
+        """
+        初始化 BL 模型
+        :param price_data: 包含各板块历史收盘价的 DataFrame
+        :param sector_ranks: 上一步算出的板块评分表 (包含 'Avg_Score')
+        :param risk_aversion: 风险厌恶系数 (Delta)，通常取 2.5-3.0
+        :param tau: 观点不确定性系数，通常取 0.025-0.05
+        """
+        self.risk_aversion = risk_aversion
+        self.tau = tau
+        self.sector_ranks = sector_ranks.set_index('板块')
+        
+        # 1. 数据清洗：剔除汇率列，只保留板块价格
+        self.prices = price_data.drop(columns=['USD_CNY', 'date'], errors='ignore')
+        if 'date' in self.prices.index.names:
+            pass # index is already date
+        
+        # 2. 计算历史收益率与协方差矩阵 (Sigma)
+        self.returns = self.prices.pct_change().dropna()
+        self.assets = self.returns.columns.tolist()
+        self.n_assets = len(self.assets)
+        
+        # 年化协方差矩阵 (假设252个交易日)
+        self.sigma = self.returns.cov() * 252
+
+    def get_market_equilibrium(self):
+        """
+        计算市场隐含均衡收益 (Pi)
+        由于很难实时获取板块的总市值，这里我们假设'等权重'为市场中性基准(Prior)，
+        或者你可以理解为我们对市场市值的先验是无信息的。
+        """
+        # 假设市场权重 (等权) -> 也可以换成真实的流通市值权重
+        w_mkt = np.array([1.0 / self.n_assets] * self.n_assets)
+        
+        # Pi = Delta * Sigma * w_mkt
+        # 这是如果不考虑人民币升值，市场“理应”给出的回报
+        pi = self.risk_aversion * self.sigma.dot(w_mkt)
+        return pi, w_mkt
+
+    def mapping_views(self):
+        """
+        【关键步骤】将 'Avg_Score' (观点分) 映射为 'Q' (预期收益向量)
+        逻辑：
+        1. 之前的 Avg_Score 范围大约在 -1 到 1 之间。
+        2. 我们不能直接说 1分 = 100% 收益。
+        3. 我们用板块的'年化波动率'作为锚点。
+           如果某板块得分 1.0 (极度看好)，我们预期它跑赢均衡收益 0.5 个标准差。
+        """
+        # 计算各板块年化波动率
+        volatilities = np.sqrt(np.diag(self.sigma))
+        
+        P = np.eye(self.n_assets) # 观点矩阵 (绝对观点，对角阵)
+        Q = np.zeros(self.n_assets) # 观点收益向量
+        
+        # 信心矩阵 Omega
+        # 简化的 He-Litterman 方法: Omega = diag(tau * P * Sigma * P.T)
+        omega = np.diag(np.diag(self.tau * self.sigma))
+        
+        print("\n>>> [BL模型] 正在将宏观因子映射为收益观点...")
+        
+        pi, _ = self.get_market_equilibrium()
+        
+        for i, asset in enumerate(self.assets):
+            # 获取该板块的得分
+            if asset in self.sector_ranks.index:
+                score = self.sector_ranks.loc[asset, 'Avg_Score']
+            else:
+                score = 0
+            
+            # --- 核心映射逻辑 ---
+            # 观点收益 Q = 隐含均衡收益 Pi + 主动观点
+            # 主动观点 = 得分 * 波动率 * 激进系数 (0.5)
+            # 含义：如果是满分，我预期它比市场隐含收益多涨 0.5 倍波动率
+            active_view = score * volatilities[i] * 0.5
+            Q[i] = pi[i] + active_view
+            
+            # 动态调整信心 (Omega)
+            # 如果得分绝对值很高(>0.5)，说明信号强烈，我们缩小方差(增加信心)
+            if abs(score) > 0.5:
+                omega[i, i] *= 0.5 
+                
+            print(f"    -> {asset:<6} | 得分:{score:>5.2f} | 隐含收益:{pi[i]:.2%} -> BL观点收益:{Q[i]:.2%}")
+            
+        return P, Q, omega
+
+    def optimize(self):
+        """
+        计算 BL 后验收益并优化权重
+        """
+        pi, w_mkt = self.get_market_equilibrium()
+        P, Q, omega = self.mapping_views()
+        
+        # --- BL 核心公式 ---
+        # 1. 计算中间项
+        tau_sigma_inv = np.linalg.inv(self.tau * self.sigma)
+        omega_inv = np.linalg.inv(omega)
+        
+        # 2. 计算后验协方差 (Posterior Sigma) 的逆
+        # M = (tau*Sigma)^-1 + P.T * Omega^-1 * P
+        M = tau_sigma_inv + P.T.dot(omega_inv).dot(P)
+        M_inv = np.linalg.inv(M)
+        
+        # 3. 计算后验预期收益 (Posterior E[R])
+        # E[R] = M^-1 * [ (tau*Sigma)^-1 * Pi + P.T * Omega^-1 * Q ]
+        term1 = tau_sigma_inv.dot(pi)
+        term2 = P.T.dot(omega_inv).dot(Q)
+        bl_returns = M_inv.dot(term1 + term2)
+        
+        # 4. 计算后验协方差 (Posterior Covariance)
+        # Sigma_BL = Sigma + M^-1
+        bl_sigma = self.sigma + M_inv
+        
+        # --- 均值-方差优化 (Mean-Variance Optimization) ---
+        # 目标：最大化夏普比率
+        print("\n>>> [BL模型] 正在进行凸优化求解最优权重...")
+        
+        def neg_sharpe(weights):
+            r = weights.dot(bl_returns)
+            vol = np.sqrt(weights.T.dot(bl_sigma).dot(weights))
+            return -r / vol # 负夏普，用于求最小
+        
+        # 约束条件
+        constraints = ({'type': 'eq', 'fun': lambda x: np.sum(x) - 1}) # 权重和为1
+        bounds = tuple((0.0, 0.4) for _ in range(self.n_assets)) # 风控：单板块最大仓位 40%
+        
+        init_guess = w_mkt
+        opts = sco.minimize(neg_sharpe, init_guess, method='SLSQP', bounds=bounds, constraints=constraints)
+        
+        if not opts.success:
+            print("!!! 优化失败，使用等权配置")
+            return pd.Series(w_mkt, index=self.assets)
+        
+        return pd.Series(opts.x, index=self.assets)
+
+# ==========================================
+# 7. 主程序续写 (Integration)
+# ==========================================
+def run_bl_process(df_data, df_result):
+    # 实例化策略
+    bl_strategy = BlackLittermanStrategy(df_data, df_result)
+    
+    # 获取优化权重
+    optimal_weights = bl_strategy.optimize()
+    
+    # 整理结果
+    df_allocation = pd.DataFrame({
+        '板块': optimal_weights.index,
+        '建议权重': optimal_weights.values
+    }).sort_values('建议权重', ascending=False)
+    
+    # 过滤掉权重极小的值显示
+    df_allocation = df_allocation[df_allocation['建议权重'] > 0.001]
+    
+    print("\n" + "="*40)
+    print("🏆 Black-Litterman 最终仓位建议")
+    print("="*40)
+    print(df_allocation)
+    
+    # 画饼图
+    plt.figure(figsize=(10, 6))
+    plt.pie(df_allocation['建议权重'], labels=df_allocation['板块'], autopct='%1.1f%%', startangle=140)
+    plt.title('基于人民币升值因子的 BL 模型资产配置', fontsize=14)
+    plt.axis('equal')
+    plt.tight_layout()
+    plt.show()
+
+# ==========================================
+# 更新 main 函数
 # ==========================================
 if __name__ == "__main__":
     # 1. 获取真实数据
@@ -221,12 +392,16 @@ if __name__ == "__main__":
         # 2. 计算原始因子
         df_factors = calculate_raw_factors(df_data)
         
-        # 3. 运行权重敏感度分析
-        # 这里会打印出三种风格下的不同排名，帮你决定权重
+        # 3. 运行权重敏感度分析 (得到 Avg_Score)
         df_result = analyze_weight_sensitivity(df_factors)
         
         print("\n>>> 最终综合排名 (按稳定性排序):")
         print(df_result[['板块', 'Avg_Score', 'Score_交易型', 'Score_投资型']])
         
-        # 4. 画图
+        # 4. 画图 (Beta 排名)
         plot_final_result(df_result)
+        
+        # ----------------------------------------
+        # >>> 续写部分：执行 BL 资产配置 <<<
+        # ----------------------------------------
+        run_bl_process(df_data, df_result)
